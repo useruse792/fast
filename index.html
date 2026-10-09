@@ -2,53 +2,239 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>Transfert temporaire</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transfert P2P</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; }
   input, button { font-size: 1rem; padding: .5rem .8rem; margin: .3rem 0; }
-  button { cursor: pointer; }
+  input[type=text] { width: 100%; box-sizing: border-box; }
+  button { cursor: pointer; margin-right: .3rem; }
+  progress { width: 100%; margin-top: 1rem; }
   #statut { min-height: 1.5em; margin-top: .5rem; }
-  #lien a { word-break: break-all; }
+  #zoneEnvoi { display: none; margin-top: 1rem; }
+  #telecharger { display: inline-block; margin-top: .5rem; }
 </style>
 </head>
 <body>
-  <h2>Envoi de fichier</h2>
-  <input type="file" id="fichier">
-  <button id="envoyer">Envoyer</button>
+  <h2>Transfert de fichier</h2>
+
+  <label>Code du salon (identique des deux côtés) :</label>
+  <input type="text" id="salon" placeholder="ex : chat-42-bleu">
+
+  <div>
+    <button id="envoyeur">J'envoie</button>
+    <button id="receveur">Je reçois</button>
+  </div>
+
+  <div id="zoneEnvoi">
+    <input type="file" id="fichier">
+    <button id="envoyer">Envoyer le fichier</button>
+  </div>
+
+  <progress id="progression" value="0" max="100"></progress>
   <p id="statut"></p>
-  <div id="lien"></div>
+  <a id="telecharger"></a>
 
 <script>
 // ====== À REMPLIR ======
+// URL de base uniquement, sans /rest/v1 à la fin
 const SUPABASE_URL = 'https://svlrekoorzxmvhoexwjx.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_nHpfwFCYGkxKXwlZMEJgYA_7uu8gXIr';
-const BUCKET = 'transferts';
 // =======================
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const CHUNK = 16 * 1024;
+const TAMPON_MAX = 4 * 1024 * 1024;
+const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 const $ = id => document.getElementById(id);
 const statut = t => $('statut').textContent = t;
 
-$('envoyer').onclick = async () => {
-  const f = $('fichier').files[0];
-  if (!f) return statut('Choisis un fichier.');
+let pc = null, canal = null, salon = '', monRole = '';
+let timer = null, enCours = false;
+const dejaTraite = new Set();
+let meta = null, morceaux = [], recu = 0;
 
+function lireSalon() {
+  salon = $('salon').value.trim();
+  if (!salon) { statut('Entre un code de salon.'); return false; }
+  return true;
+}
+
+function arreterEcoute() {
+  if (timer) clearInterval(timer);
+  timer = null;
+}
+
+function nouvellePC() {
+  if (pc) pc.close();
+  pc = new RTCPeerConnection(config);
+  pc.onconnectionstatechange = () => {
+    const etat = pc.connectionState;
+    if (etat === 'connected') {
+      arreterEcoute();
+    } else if (etat === 'failed') {
+      statut('Connexion impossible : ton réseau bloque WebRTC.');
+    } else if (etat === 'connecting') {
+      statut('Connexion en cours...');
+    }
+  };
+  pc.ondatachannel = e => brancherCanal(e.channel);
+}
+
+function brancherCanal(c) {
+  canal = c;
+  canal.binaryType = 'arraybuffer';
+  canal.onopen = () => statut('Connecté ✅');
+  canal.onclose = () => statut('Canal fermé.');
+  canal.onmessage = e => recevoir(e.data);
+  if (c.readyState === 'open') statut('Connecté ✅');
+}
+
+// Attend la fin de la collecte réseau (ICE), avec un délai de sécurité
+function attendreIce() {
+  return new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const verifier = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', verifier);
+        res();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', verifier);
+    setTimeout(res, 5000);
+  });
+}
+
+async function publier(role, desc) {
+  const { error } = await sb.from('signaux')
+    .upsert({ salon, role, contenu: JSON.stringify(desc) });
+  if (error) throw new Error('Publication : ' + error.message);
+}
+
+// Traite la ligne de signalisation de l'autre côté, une seule fois
+async function traiter(ligne) {
+  if (!ligne || !ligne.contenu || dejaTraite.has(ligne.contenu)) return;
+  dejaTraite.add(ligne.contenu);
+  const desc = JSON.parse(ligne.contenu);
+
+  if (monRole === 'receveur' && desc.type === 'offer') {
+    // Nouvelle offre : on repart d'une connexion propre
+    if (pc.remoteDescription) nouvellePC();
+    statut('Offre reçue, création de la réponse...');
+    await pc.setRemoteDescription(desc);
+    await pc.setLocalDescription(await pc.createAnswer());
+    await attendreIce();
+    await publier('receveur', pc.localDescription);
+    statut('Réponse envoyée, connexion en cours...');
+  } else if (monRole === 'envoyeur' && desc.type === 'answer') {
+    statut('Réponse reçue, connexion en cours...');
+    await pc.setRemoteDescription(desc);
+  }
+}
+
+// Lit toutes les 1,5 s la ligne de l'autre côté
+function demarrerEcoute() {
+  arreterEcoute();
+  dejaTraite.clear();
+  const autre = monRole === 'envoyeur' ? 'receveur' : 'envoyeur';
+
+  const verifier = async () => {
+    if (enCours) return;
+    enCours = true;
+    try {
+      const { data, error } = await sb.from('signaux')
+        .select('*').eq('salon', salon).eq('role', autre).maybeSingle();
+      if (error) throw new Error('Lecture : ' + error.message);
+      await traiter(data);
+    } catch (e) {
+      statut('Erreur : ' + e.message);
+    } finally {
+      enCours = false;
+    }
+  };
+
+  verifier();
+  timer = setInterval(verifier, 1500);
+}
+
+// Envoyeur : crée l'offre et la publie
+$('envoyeur').onclick = async () => {
+  if (!lireSalon()) return;
   try {
-    // Nom unique pour éviter les collisions
-    const chemin = `${Date.now()}-${f.name.replace(/[^\w.-]/g, '_')}`;
-    statut('Envoi en cours...');
-
-    const { error } = await sb.storage.from(BUCKET).upload(chemin, f);
-    if (error) throw error;
-
-    const { data } = sb.storage.from(BUCKET).getPublicUrl(chemin);
-    $('lien').innerHTML = `<p>Lien à envoyer :</p><a href="${data.publicUrl}" target="_blank">${data.publicUrl}</a>`;
-    statut('Fichier envoyé ✅');
+    monRole = 'envoyeur';
+    nouvellePC();
+    brancherCanal(pc.createDataChannel('fichier'));
+    const { error } = await sb.from('signaux').delete().eq('salon', salon);
+    if (error) throw new Error('Nettoyage : ' + error.message);
+    await pc.setLocalDescription(await pc.createOffer());
+    await attendreIce();
+    await publier('envoyeur', pc.localDescription);
+    $('zoneEnvoi').style.display = 'block';
+    statut('En attente du receveur...');
+    demarrerEcoute();
   } catch (e) {
     statut('Erreur : ' + e.message);
   }
 };
+
+// Receveur : attend l'offre et répond automatiquement
+$('receveur').onclick = async () => {
+  if (!lireSalon()) return;
+  try {
+    monRole = 'receveur';
+    nouvellePC();
+    const { error } = await sb.from('signaux').delete()
+      .eq('salon', salon).eq('role', 'receveur');
+    if (error) throw new Error('Nettoyage : ' + error.message);
+    statut('En attente de l\'envoyeur...');
+    demarrerEcoute();
+  } catch (e) {
+    statut('Erreur : ' + e.message);
+  }
+};
+
+// Envoi du fichier
+$('envoyer').onclick = async () => {
+  const f = $('fichier').files[0];
+  if (!f || !canal || canal.readyState !== 'open') {
+    return statut('Pas encore connecté ou pas de fichier.');
+  }
+  canal.send(JSON.stringify({ name: f.name, size: f.size, type: f.type }));
+  for (let off = 0; off < f.size; off += CHUNK) {
+    const buf = await f.slice(off, off + CHUNK).arrayBuffer();
+    while (canal.bufferedAmount > TAMPON_MAX) {
+      await new Promise(r => setTimeout(r, 20));
+    }
+    canal.send(buf);
+    $('progression').value = (off / f.size) * 100;
+  }
+  canal.send('EOF');
+  $('progression').value = 100;
+  statut('Envoi terminé ✅');
+};
+
+// Réception
+function recevoir(d) {
+  if (typeof d === 'string') {
+    if (d === 'EOF') {
+      const lien = $('telecharger');
+      lien.href = URL.createObjectURL(new Blob(morceaux, { type: meta.type }));
+      lien.download = meta.name;
+      lien.textContent = `Télécharger ${meta.name}`;
+      statut('Fichier reçu ✅');
+      morceaux = []; recu = 0; meta = null;
+    } else {
+      meta = JSON.parse(d);
+      morceaux = []; recu = 0;
+      statut(`Réception de ${meta.name}...`);
+    }
+    return;
+  }
+  morceaux.push(d);
+  recu += d.byteLength;
+  $('progression').value = (recu / meta.size) * 100;
+}
 </script>
 </body>
 </html>
