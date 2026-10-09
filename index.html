@@ -65,13 +65,13 @@ function ecouterSignaux(monRole) {
         }
       })
     .subscribe();
-  const { data } = await sb.from('signaux').select('*').eq('salon', salon);
+ }
+ const { data } = await sb.from('signaux').select('*').eq('salon', salon);
 for (const ligne of data || []) {
   if (ligne.role !== monRole && ligne.contenu) {
     // on rejoue l'offre ou la réponse déjà présente
     ecouterSignaux.traiter?.(ligne);
   }
-}
 }
 
 async function publier(monRole, desc) {
