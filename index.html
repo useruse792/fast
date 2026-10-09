@@ -2,208 +2,53 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
-<title>Transfert P2P</title>
+<title>Transfert temporaire</title>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; }
   input, button { font-size: 1rem; padding: .5rem .8rem; margin: .3rem 0; }
-  input[type=text] { width: 100%; box-sizing: border-box; }
   button { cursor: pointer; }
-  progress { width: 100%; margin-top: 1rem; }
   #statut { min-height: 1.5em; margin-top: .5rem; }
+  #lien a { word-break: break-all; }
 </style>
 </head>
 <body>
-  <h2>Transfert de fichier</h2>
-  <label>Code du salon (le même pour les deux) :</label>
-  <input type="text" id="salon" placeholder="ex : chat-42-bleu">
-  <div>
-    <button id="envoyeur">J'envoie</button>
-    <button id="receveur">Je reçois</button>
-  </div>
-  <div id="zoneEnvoi" style="display:none">
-    <input type="file" id="fichier">
-    <button id="envoyer">Envoyer le fichier</button>
-  </div>
-  <progress id="progression" value="0" max="100"></progress>
+  <h2>Envoi de fichier</h2>
+  <input type="file" id="fichier">
+  <button id="envoyer">Envoyer</button>
   <p id="statut"></p>
-  <a id="telecharger"></a>
+  <div id="lien"></div>
 
 <script>
 // ====== À REMPLIR ======
 const SUPABASE_URL = 'https://svlrekoorzxmvhoexwjx.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_nHpfwFCYGkxKXwlZMEJgYA_7uu8gXIr';
+const BUCKET = 'transferts';
 // =======================
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
-const CHUNK = 16 * 1024;
 const $ = id => document.getElementById(id);
 const statut = t => $('statut').textContent = t;
-const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-let pc = null;
-let canal = null;
-let canalSignal = null;
-let salon = '';
-let monRole = '';
-const dejaTraite = new Set();
-let meta = null, morceaux = [], recu = 0;
-
-function lireSalon() {
-  salon = $('salon').value.trim();
-  if (!salon) { statut('Entre un code de salon.'); return false; }
-  return true;
-}
-
-function nouvellePC() {
-  if (pc) pc.close();
-  pc = new RTCPeerConnection(config);
-  pc.onconnectionstatechange = () => statut('Connexion : ' + pc.connectionState);
-  pc.ondatachannel = e => brancherCanal(e.channel);
-}
-
-function brancherCanal(c) {
-  canal = c;
-  canal.binaryType = 'arraybuffer';
-  canal.onopen = () => statut('Connecté ✅');
-  canal.onclose = () => statut('Canal fermé');
-  canal.onmessage = e => recevoir(e.data);
-}
-
-// Attend la fin de la collecte réseau (ICE), avec un délai de sécurité
-function attendreIce() {
-  return new Promise(res => {
-    if (pc.iceGatheringState === 'complete') return res();
-    const verifier = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', verifier);
-        res();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', verifier);
-    setTimeout(res, 5000);
-  });
-}
-
-async function publier(role, desc) {
-  const { error } = await sb.from('signaux')
-    .upsert({ salon, role, contenu: JSON.stringify(desc) });
-  if (error) throw new Error('Publication : ' + error.message);
-}
-
-// Traite une ligne de signalisation venant de l'autre côté
-async function traiter(ligne) {
-  if (!ligne || !ligne.contenu || ligne.role === monRole) return;
-  if (dejaTraite.has(ligne.contenu)) return;
-  dejaTraite.add(ligne.contenu);
-
-  const desc = JSON.parse(ligne.contenu);
-
-  if (monRole === 'receveur' && desc.type === 'offer') {
-    await pc.setRemoteDescription(desc);
-    await pc.setLocalDescription(await pc.createAnswer());
-    await attendreIce();
-    await publier('receveur', pc.localDescription);
-    statut('Réponse envoyée, connexion en cours...');
-  } else if (monRole === 'envoyeur' && desc.type === 'answer') {
-    await pc.setRemoteDescription(desc);
-    statut('Réponse reçue, connexion en cours...');
-  }
-}
-
-// S'abonne aux changements, puis lit ce qui est déjà présent dans la table
-async function ecouterSignaux() {
-  if (canalSignal) await sb.removeChannel(canalSignal);
-
-  canalSignal = sb.channel('sig-' + salon)
-    .on('postgres_changes',
-      { event: '*', schema: 'public', table: 'signaux', filter: `salon=eq.${salon}` },
-      payload => traiter(payload.new).catch(e => statut('Erreur : ' + e.message)))
-    .subscribe(async etat => {
-      if (etat !== 'SUBSCRIBED') return;
-      const { data, error } = await sb.from('signaux').select('*').eq('salon', salon);
-      if (error) return statut('Erreur lecture : ' + error.message);
-      for (const ligne of data || []) {
-        await traiter(ligne).catch(e => statut('Erreur : ' + e.message));
-      }
-    });
-}
-
-// Envoyeur : crée l'offre et la publie
-$('envoyeur').onclick = async () => {
-  if (!lireSalon()) return;
-  try {
-    monRole = 'envoyeur';
-    nouvellePC();
-    brancherCanal(pc.createDataChannel('fichier'));
-    await sb.from('signaux').delete().eq('salon', salon);
-    dejaTraite.clear();
-    await pc.setLocalDescription(await pc.createOffer());
-    await attendreIce();
-    await publier('envoyeur', pc.localDescription);
-    await ecouterSignaux();
-    $('zoneEnvoi').style.display = 'block';
-    statut('En attente du receveur...');
-  } catch (e) {
-    statut('Erreur : ' + e.message);
-  }
-};
-
-// Receveur : écoute l'offre et répond automatiquement
-$('receveur').onclick = async () => {
-  if (!lireSalon()) return;
-  try {
-    monRole = 'receveur';
-    nouvellePC();
-    dejaTraite.clear();
-    await ecouterSignaux();
-    statut('En attente de l\'envoyeur...');
-  } catch (e) {
-    statut('Erreur : ' + e.message);
-  }
-};
-
-// Envoi du fichier
 $('envoyer').onclick = async () => {
   const f = $('fichier').files[0];
-  if (!f || !canal || canal.readyState !== 'open') {
-    return statut('Pas encore connecté ou pas de fichier');
-  }
-  canal.send(JSON.stringify({ name: f.name, size: f.size, type: f.type }));
-  for (let off = 0; off < f.size; off += CHUNK) {
-    const buf = await f.slice(off, off + CHUNK).arrayBuffer();
-    while (canal.bufferedAmount > 4 * 1024 * 1024) {
-      await new Promise(r => setTimeout(r, 20));
-    }
-    canal.send(buf);
-    $('progression').value = (off / f.size) * 100;
-  }
-  canal.send('EOF');
-  $('progression').value = 100;
-  statut('Envoi terminé ✅');
-};
+  if (!f) return statut('Choisis un fichier.');
 
-// Réception
-function recevoir(d) {
-  if (typeof d === 'string') {
-    if (d === 'EOF') {
-      const lien = $('telecharger');
-      lien.href = URL.createObjectURL(new Blob(morceaux, { type: meta.type }));
-      lien.download = meta.name;
-      lien.textContent = `Télécharger ${meta.name}`;
-      statut('Fichier reçu ✅');
-      morceaux = []; recu = 0; meta = null;
-    } else {
-      meta = JSON.parse(d);
-      morceaux = []; recu = 0;
-      statut(`Réception de ${meta.name}...`);
-    }
-    return;
+  try {
+    // Nom unique pour éviter les collisions
+    const chemin = `${Date.now()}-${f.name.replace(/[^\w.-]/g, '_')}`;
+    statut('Envoi en cours...');
+
+    const { error } = await sb.storage.from(BUCKET).upload(chemin, f);
+    if (error) throw error;
+
+    const { data } = sb.storage.from(BUCKET).getPublicUrl(chemin);
+    $('lien').innerHTML = `<p>Lien à envoyer :</p><a href="${data.publicUrl}" target="_blank">${data.publicUrl}</a>`;
+    statut('Fichier envoyé ✅');
+  } catch (e) {
+    statut('Erreur : ' + e.message);
   }
-  morceaux.push(d);
-  recu += d.byteLength;
-  $('progression').value = (recu / meta.size) * 100;
-}
+};
 </script>
 </body>
 </html>
