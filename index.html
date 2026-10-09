@@ -3,135 +3,133 @@
 <head>
 <meta charset="UTF-8">
 <title>Transfert P2P</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
-  textarea { width: 100%; height: 80px; margin: .3rem 0 1rem; font-family: monospace; font-size: 12px; box-sizing: border-box; }
-  button { padding: .5rem 1rem; margin: .2rem 0; cursor: pointer; }
-  progress { width: 100%; }
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: 2rem auto; padding: 0 1rem; }
+  input, button { font-size: 1rem; padding: .5rem .8rem; margin: .3rem 0; }
+  input[type=text] { width: 100%; box-sizing: border-box; }
+  button { cursor: pointer; }
+  progress { width: 100%; margin-top: 1rem; }
+  #statut { min-height: 1.5em; margin-top: .5rem; }
 </style>
 </head>
 <body>
-  <h2>1. Côté envoyeur</h2>
-  <button id="creer">Créer l'offre</button>
-  <p>Ton code à copier (offre) :</p>
-  <textarea id="monCode" readonly></textarea>
-  <p>Code de l'autre personne (réponse) :</p>
-  <textarea id="codeReponse"></textarea>
-  <button id="connecter">Se connecter</button>
-
-  <h2>2. Côté receveur</h2>
-  <p>Code de l'envoyeur (offre) :</p>
-  <textarea id="codeOffre"></textarea>
-  <button id="repondre">Générer la réponse</button>
-  <p>Ta réponse à renvoyer :</p>
-  <textarea id="maReponse" readonly></textarea>
-
-  <h2>3. Transfert</h2>
-  <input type="file" id="fichier">
-  <button id="envoyer">Envoyer</button>
+  <h2>Transfert de fichier</h2>
+  <label>Code du salon (le même pour les deux) :</label>
+  <input type="text" id="salon" placeholder="ex : chat-42-bleu">
+  <div>
+    <button id="envoyeur">J'envoie</button>
+    <button id="receveur">Je reçois</button>
+  </div>
+  <div id="zoneEnvoi" style="display:none">
+    <input type="file" id="fichier">
+    <button id="envoyer">Envoyer le fichier</button>
+  </div>
   <progress id="progression" value="0" max="100"></progress>
   <p id="statut"></p>
   <a id="telecharger"></a>
 
 <script>
+// ====== À REMPLIR ======
+const SUPABASE_URL = 'https://svlrekoorzxmvhoexwjx.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_nHpfwFCYGkxKXwlZMEJgYA_7uu8gXIr';
+// =======================
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 const CHUNK = 16 * 1024;
 const $ = id => document.getElementById(id);
 const statut = t => $('statut').textContent = t;
 
-let pc = null;
-let canal = null;
+let pc, canal, salon, role;
 let meta = null, morceaux = [], recu = 0;
+const attente = [];
 
-function nouvelleConnexion() {
-  pc = new RTCPeerConnection({
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-  });
-  pc.onconnectionstatechange = () => statut('Connexion : ' + pc.connectionState);
-  pc.ondatachannel = e => brancherCanal(e.channel);
-  return pc;
+const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+// Écoute les messages de signalisation de l'autre côté
+function ecouterSignaux(monRole) {
+  const autre = monRole === 'envoyeur' ? 'receveur' : 'envoyeur';
+  sb.channel('sig-' + salon)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'signaux', filter: `salon=eq.${salon}` },
+      async payload => {
+        const ligne = payload.new;
+        if (!ligne || ligne.role !== autre || !ligne.contenu) return;
+        const desc = JSON.parse(ligne.contenu);
+        if (desc.type === 'offer' && monRole === 'receveur') {
+          await pc.setRemoteDescription(desc);
+          await pc.setLocalDescription(await pc.createAnswer());
+          await attendreIce();
+          await publier('receveur', pc.localDescription);
+        } else if (desc.type === 'answer' && monRole === 'envoyeur') {
+          await pc.setRemoteDescription(desc);
+        }
+      })
+    .subscribe();
 }
 
-// Attend la fin de la collecte ICE, avec un délai de sécurité
+async function publier(monRole, desc) {
+  await sb.from('signaux').upsert({ salon, role: monRole, contenu: JSON.stringify(desc) });
+}
+
 function attendreIce() {
   return new Promise(res => {
     if (pc.iceGatheringState === 'complete') return res();
-    const verifier = () => {
-      if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', verifier);
-        res();
-      }
-    };
-    pc.addEventListener('icegatheringstatechange', verifier);
-    setTimeout(res, 5000); // on continue quoi qu'il arrive après 5 s
+    const v = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', v); res(); } };
+    pc.addEventListener('icegatheringstatechange', v);
+    setTimeout(res, 5000);
   });
+}
+
+function nouvellePC() {
+  pc = new RTCPeerConnection(config);
+  pc.onconnectionstatechange = () => statut('Connexion : ' + pc.connectionState);
+  pc.ondatachannel = e => brancherCanal(e.channel);
 }
 
 function brancherCanal(c) {
   canal = c;
   canal.binaryType = 'arraybuffer';
   canal.onopen = () => statut('Connecté ✅');
-  canal.onclose = () => statut('Canal fermé');
   canal.onmessage = e => recevoir(e.data);
 }
 
-function encoder(desc) {
-  return btoa(unescape(encodeURIComponent(JSON.stringify(desc))));
-}
-function decoder(texte) {
-  return JSON.parse(decodeURIComponent(escape(atob(texte.trim()))));
+function lireSalon() {
+  salon = $('salon').value.trim();
+  if (!salon) { statut('Entre un code de salon.'); return false; }
+  return true;
 }
 
-// Envoyeur : créer l'offre
-$('creer').onclick = async () => {
-  try {
-    nouvelleConnexion();
-    brancherCanal(pc.createDataChannel('fichier'));
-    statut('Création de l\'offre...');
-    await pc.setLocalDescription(await pc.createOffer());
-    await attendreIce();
-    $('monCode').value = encoder(pc.localDescription);
-    statut('Offre prête, copie-la et envoie-la à l\'autre personne.');
-  } catch (err) {
-    statut('Erreur : ' + err.message);
-  }
+// Envoyeur : crée l'offre et la publie
+$('envoyeur').onclick = async () => {
+  if (!lireSalon()) return;
+  role = 'envoyeur';
+  nouvellePC();
+  brancherCanal(pc.createDataChannel('fichier'));
+  ecouterSignaux('envoyeur');
+  await pc.setLocalDescription(await pc.createOffer());
+  await attendreIce();
+  await publier('envoyeur', pc.localDescription);
+  $('zoneEnvoi').style.display = 'block';
+  statut('En attente du receveur...');
 };
 
-// Envoyeur : appliquer la réponse
-$('connecter').onclick = async () => {
-  try {
-    await pc.setRemoteDescription(decoder($('codeReponse').value));
-    statut('Réponse appliquée, connexion en cours...');
-  } catch (err) {
-    statut('Erreur : ' + err.message);
-  }
-};
-
-// Receveur : générer la réponse à partir de l'offre
-$('repondre').onclick = async () => {
-  try {
-    nouvelleConnexion();
-    await pc.setRemoteDescription(decoder($('codeOffre').value));
-    await pc.setLocalDescription(await pc.createAnswer());
-    await attendreIce();
-    $('maReponse').value = encoder(pc.localDescription);
-    statut('Réponse prête, renvoie-la à l\'envoyeur.');
-  } catch (err) {
-    statut('Erreur : ' + err.message);
-  }
+// Receveur : écoute l'offre et répond automatiquement
+$('receveur').onclick = () => {
+  if (!lireSalon()) return;
+  role = 'receveur';
+  nouvellePC();
+  ecouterSignaux('receveur');
+  statut('En attente de l\'envoyeur...');
 };
 
 // Envoi du fichier
 $('envoyer').onclick = async () => {
   const f = $('fichier').files[0];
-  if (!f || !canal || canal.readyState !== 'open') return statut('Pas connecté ou pas de fichier');
-
+  if (!f || !canal || canal.readyState !== 'open') return statut('Pas encore connecté ou pas de fichier');
   canal.send(JSON.stringify({ name: f.name, size: f.size, type: f.type }));
-
   for (let off = 0; off < f.size; off += CHUNK) {
     const buf = await f.slice(off, off + CHUNK).arrayBuffer();
-    while (canal.bufferedAmount > 4 * 1024 * 1024) {
-      await new Promise(r => setTimeout(r, 20));
-    }
+    while (canal.bufferedAmount > 4 * 1024 * 1024) await new Promise(r => setTimeout(r, 20));
     canal.send(buf);
     $('progression').value = (off / f.size) * 100;
   }
@@ -140,13 +138,11 @@ $('envoyer').onclick = async () => {
   statut('Envoi terminé ✅');
 };
 
-// Réception
 function recevoir(d) {
   if (typeof d === 'string') {
     if (d === 'EOF') {
-      const blob = new Blob(morceaux, { type: meta.type });
       const lien = $('telecharger');
-      lien.href = URL.createObjectURL(blob);
+      lien.href = URL.createObjectURL(new Blob(morceaux, { type: meta.type }));
       lien.download = meta.name;
       lien.textContent = `Télécharger ${meta.name}`;
       statut('Fichier reçu ✅');
