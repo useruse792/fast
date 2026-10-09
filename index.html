@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>Transfert P2P</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; height: 80px; margin: .3rem 0 1rem; font-family: monospace; font-size: 12px; }
+  button { padding: .5rem 1rem; margin: .2rem 0; cursor: pointer; }
+  progress { width: 100%; }
+</style>
+</head>
+<body>
+  <h2>1. Côté envoyeur</h2>
+  <button id="creer">Créer l'offre</button>
+  <p>Ton code à copier :</p>
+  <textarea id="monCode" readonly></textarea>
+  <p>Code de l'autre personne (réponse) :</p>
+  <textarea id="codeReponse"></textarea>
+  <button id="connecter">Se connecter</button>
+
+  <h2>2. Côté receveur</h2>
+  <p>Code de l'envoyeur (offre) :</p>
+  <textarea id="codeOffre"></textarea>
+  <button id="repondre">Générer la réponse</button>
+  <p>Ta réponse à renvoyer :</p>
+  <textarea id="maReponse" readonly></textarea>
+
+  <h2>3. Transfert</h2>
+  <input type="file" id="fichier">
+  <button id="envoyer">Envoyer</button>
+  <progress id="progression" value="0" max="100"></progress>
+  <p id="statut"></p>
+  <a id="telecharger"></a>
+
+<script>
+const CHUNK = 16 * 1024;                         // taille des morceaux
+const pc = new RTCPeerConnection({
+  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+});
+let canal = null;
+let meta = null, morceaux = [], recu = 0;
+
+const $ = id => document.getElementById(id);
+const statut = t => $('statut').textContent = t;
+
+// Attend que les infos réseau (ICE) soient toutes collectées
+function attendreIce() {
+  return new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    pc.addEventListener('icegatheringstatechange', () => {
+      if (pc.iceGatheringState === 'complete') res();
+    });
+  });
+}
+
+function brancherCanal(c) {
+  canal = c;
+  canal.binaryType = 'arraybuffer';
+  canal.onopen = () => statut('Connecté');
+  canal.onmessage = e => recevoir(e.data);
+}
+
+// Côté envoyeur : on crée le canal et l'offre
+$('creer').onclick = async () => {
+  brancherCanal(pc.createDataChannel('fichier'));
+  await pc.setLocalDescription(await pc.createOffer());
+  await attendreIce();
+  $('monCode').value = btoa(JSON.stringify(pc.localDescription));
+};
+
+// Côté envoyeur : on applique la réponse reçue
+$('connecter').onclick = async () => {
+  const reponse = JSON.parse(atob($('codeReponse').value.trim()));
+  await pc.setRemoteDescription(reponse);
+};
+
+// Côté receveur : on reçoit le canal et on génère la réponse
+pc.ondatachannel = e => brancherCanal(e.channel);
+
+$('repondre').onclick = async () => {
+  const offre = JSON.parse(atob($('codeOffre').value.trim()));
+  await pc.setRemoteDescription(offre);
+  await pc.setLocalDescription(await pc.createAnswer());
+  await attendreIce();
+  $('maReponse').value = btoa(JSON.stringify(pc.localDescription));
+};
+
+// Envoi du fichier
+$('envoyer').onclick = async () => {
+  const f = $('fichier').files[0];
+  if (!f || !canal || canal.readyState !== 'open') return statut('Pas connecté ou pas de fichier');
+
+  canal.send(JSON.stringify({ name: f.name, size: f.size, type: f.type }));
+
+  for (let off = 0; off < f.size; off += CHUNK) {
+    const buf = await f.slice(off, off + CHUNK).arrayBuffer();
+    // Contre-pression : on attend si le buffer d'envoi se remplit
+    while (canal.bufferedAmount > 4 * 1024 * 1024) {
+      await new Promise(r => setTimeout(r, 20));
+    }
+    canal.send(buf);
+    $('progression').value = (off / f.size) * 100;
+  }
+  canal.send('EOF');
+  $('progression').value = 100;
+  statut('Envoi terminé ');
+};
+
+// Réception
+function recevoir(d) {
+  if (typeof d === 'string') {
+    if (d === 'EOF') {
+      const blob = new Blob(morceaux, { type: meta.type });
+      const lien = $('telecharger');
+      lien.href = URL.createObjectURL(blob);
+      lien.download = meta.name;
+      lien.textContent = `Télécharger ${meta.name}`;
+      statut('Fichier reçu ');
+      morceaux = []; recu = 0; meta = null;
+    } else {
+      meta = JSON.parse(d);
+      statut(`Réception de ${meta.name}...`);
+    }
+    return;
+  }
+  morceaux.push(d);
+  recu += d.byteLength;
+  $('progression').value = (recu / meta.size) * 100;
+}
+</script>
+</body>
+</html>
