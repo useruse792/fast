@@ -39,55 +39,24 @@ const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 const CHUNK = 16 * 1024;
 const $ = id => document.getElementById(id);
 const statut = t => $('statut').textContent = t;
-
-let pc, canal, salon, role;
-let meta = null, morceaux = [], recu = 0;
-const attente = [];
-
 const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-// Écoute les messages de signalisation de l'autre côté
-function ecouterSignaux(monRole) {
-  const autre = monRole === 'envoyeur' ? 'receveur' : 'envoyeur';
-  sb.channel('sig-' + salon)
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'signaux', filter: `salon=eq.${salon}` },
-      async payload => {
-        const ligne = payload.new;
-        if (!ligne || ligne.role !== autre || !ligne.contenu) return;
-        const desc = JSON.parse(ligne.contenu);
-        if (desc.type === 'offer' && monRole === 'receveur') {
-          await pc.setRemoteDescription(desc);
-          await pc.setLocalDescription(await pc.createAnswer());
-          await attendreIce();
-          await publier('receveur', pc.localDescription);
-        } else if (desc.type === 'answer' && monRole === 'envoyeur') {
-          await pc.setRemoteDescription(desc);
-        }
-      })
-    .subscribe();
- }
- const { data } = await sb.from('signaux').select('*').eq('salon', salon);
-for (const ligne of data || []) {
-  if (ligne.role !== monRole && ligne.contenu) {
-    // on rejoue l'offre ou la réponse déjà présente
-    ecouterSignaux.traiter?.(ligne);
-  }
-}
+let pc = null;
+let canal = null;
+let canalSignal = null;
+let salon = '';
+let monRole = '';
+const dejaTraite = new Set();
+let meta = null, morceaux = [], recu = 0;
 
-async function publier(monRole, desc) {
-  await sb.from('signaux').upsert({ salon, role: monRole, contenu: JSON.stringify(desc) });
-}
-
-function attendreIce() {
-  return new Promise(res => {
-    if (pc.iceGatheringState === 'complete') return res();
-    const v = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', v); res(); } };
-    pc.addEventListener('icegatheringstatechange', v);
-    setTimeout(res, 5000);
-  });
+function lireSalon() {
+  salon = $('salon').value.trim();
+  if (!salon) { statut('Entre un code de salon.'); return false; }
+  return true;
 }
 
 function nouvellePC() {
+  if (pc) pc.close();
   pc = new RTCPeerConnection(config);
   pc.onconnectionstatechange = () => statut('Connexion : ' + pc.connectionState);
   pc.ondatachannel = e => brancherCanal(e.channel);
@@ -97,46 +66,115 @@ function brancherCanal(c) {
   canal = c;
   canal.binaryType = 'arraybuffer';
   canal.onopen = () => statut('Connecté ✅');
+  canal.onclose = () => statut('Canal fermé');
   canal.onmessage = e => recevoir(e.data);
 }
 
-function lireSalon() {
-  salon = $('salon').value.trim();
-  if (!salon) { statut('Entre un code de salon.'); return false; }
-  return true;
+// Attend la fin de la collecte réseau (ICE), avec un délai de sécurité
+function attendreIce() {
+  return new Promise(res => {
+    if (pc.iceGatheringState === 'complete') return res();
+    const verifier = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', verifier);
+        res();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', verifier);
+    setTimeout(res, 5000);
+  });
+}
+
+async function publier(role, desc) {
+  const { error } = await sb.from('signaux')
+    .upsert({ salon, role, contenu: JSON.stringify(desc) });
+  if (error) throw new Error('Publication : ' + error.message);
+}
+
+// Traite une ligne de signalisation venant de l'autre côté
+async function traiter(ligne) {
+  if (!ligne || !ligne.contenu || ligne.role === monRole) return;
+  if (dejaTraite.has(ligne.contenu)) return;
+  dejaTraite.add(ligne.contenu);
+
+  const desc = JSON.parse(ligne.contenu);
+
+  if (monRole === 'receveur' && desc.type === 'offer') {
+    await pc.setRemoteDescription(desc);
+    await pc.setLocalDescription(await pc.createAnswer());
+    await attendreIce();
+    await publier('receveur', pc.localDescription);
+    statut('Réponse envoyée, connexion en cours...');
+  } else if (monRole === 'envoyeur' && desc.type === 'answer') {
+    await pc.setRemoteDescription(desc);
+    statut('Réponse reçue, connexion en cours...');
+  }
+}
+
+// S'abonne aux changements, puis lit ce qui est déjà présent dans la table
+async function ecouterSignaux() {
+  if (canalSignal) await sb.removeChannel(canalSignal);
+
+  canalSignal = sb.channel('sig-' + salon)
+    .on('postgres_changes',
+      { event: '*', schema: 'public', table: 'signaux', filter: `salon=eq.${salon}` },
+      payload => traiter(payload.new).catch(e => statut('Erreur : ' + e.message)))
+    .subscribe(async etat => {
+      if (etat !== 'SUBSCRIBED') return;
+      const { data, error } = await sb.from('signaux').select('*').eq('salon', salon);
+      if (error) return statut('Erreur lecture : ' + error.message);
+      for (const ligne of data || []) {
+        await traiter(ligne).catch(e => statut('Erreur : ' + e.message));
+      }
+    });
 }
 
 // Envoyeur : crée l'offre et la publie
 $('envoyeur').onclick = async () => {
   if (!lireSalon()) return;
-  role = 'envoyeur';
-  nouvellePC();
-  brancherCanal(pc.createDataChannel('fichier'));
-  ecouterSignaux('envoyeur');
-  await pc.setLocalDescription(await pc.createOffer());
-  await attendreIce();
-  await publier('envoyeur', pc.localDescription);
-  $('zoneEnvoi').style.display = 'block';
-  statut('En attente du receveur...');
+  try {
+    monRole = 'envoyeur';
+    nouvellePC();
+    brancherCanal(pc.createDataChannel('fichier'));
+    await sb.from('signaux').delete().eq('salon', salon);
+    dejaTraite.clear();
+    await pc.setLocalDescription(await pc.createOffer());
+    await attendreIce();
+    await publier('envoyeur', pc.localDescription);
+    await ecouterSignaux();
+    $('zoneEnvoi').style.display = 'block';
+    statut('En attente du receveur...');
+  } catch (e) {
+    statut('Erreur : ' + e.message);
+  }
 };
 
 // Receveur : écoute l'offre et répond automatiquement
-$('receveur').onclick = () => {
+$('receveur').onclick = async () => {
   if (!lireSalon()) return;
-  role = 'receveur';
-  nouvellePC();
-  ecouterSignaux('receveur');
-  statut('En attente de l\'envoyeur...');
+  try {
+    monRole = 'receveur';
+    nouvellePC();
+    dejaTraite.clear();
+    await ecouterSignaux();
+    statut('En attente de l\'envoyeur...');
+  } catch (e) {
+    statut('Erreur : ' + e.message);
+  }
 };
 
 // Envoi du fichier
 $('envoyer').onclick = async () => {
   const f = $('fichier').files[0];
-  if (!f || !canal || canal.readyState !== 'open') return statut('Pas encore connecté ou pas de fichier');
+  if (!f || !canal || canal.readyState !== 'open') {
+    return statut('Pas encore connecté ou pas de fichier');
+  }
   canal.send(JSON.stringify({ name: f.name, size: f.size, type: f.type }));
   for (let off = 0; off < f.size; off += CHUNK) {
     const buf = await f.slice(off, off + CHUNK).arrayBuffer();
-    while (canal.bufferedAmount > 4 * 1024 * 1024) await new Promise(r => setTimeout(r, 20));
+    while (canal.bufferedAmount > 4 * 1024 * 1024) {
+      await new Promise(r => setTimeout(r, 20));
+    }
     canal.send(buf);
     $('progression').value = (off / f.size) * 100;
   }
@@ -145,6 +183,7 @@ $('envoyer').onclick = async () => {
   statut('Envoi terminé ✅');
 };
 
+// Réception
 function recevoir(d) {
   if (typeof d === 'string') {
     if (d === 'EOF') {
@@ -156,6 +195,7 @@ function recevoir(d) {
       morceaux = []; recu = 0; meta = null;
     } else {
       meta = JSON.parse(d);
+      morceaux = []; recu = 0;
       statut(`Réception de ${meta.name}...`);
     }
     return;
