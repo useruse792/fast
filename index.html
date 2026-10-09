@@ -5,7 +5,7 @@
 <title>Transfert P2P</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
-  textarea { width: 100%; height: 80px; margin: .3rem 0 1rem; font-family: monospace; font-size: 12px; }
+  textarea { width: 100%; height: 80px; margin: .3rem 0 1rem; font-family: monospace; font-size: 12px; box-sizing: border-box; }
   button { padding: .5rem 1rem; margin: .2rem 0; cursor: pointer; }
   progress { width: 100%; }
 </style>
@@ -13,7 +13,7 @@
 <body>
   <h2>1. Côté envoyeur</h2>
   <button id="creer">Créer l'offre</button>
-  <p>Ton code à copier :</p>
+  <p>Ton code à copier (offre) :</p>
   <textarea id="monCode" readonly></textarea>
   <p>Code de l'autre personne (réponse) :</p>
   <textarea id="codeReponse"></textarea>
@@ -34,56 +34,90 @@
   <a id="telecharger"></a>
 
 <script>
-const CHUNK = 16 * 1024;                         // taille des morceaux
-const pc = new RTCPeerConnection({
-  iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-});
-let canal = null;
-let meta = null, morceaux = [], recu = 0;
-
+const CHUNK = 16 * 1024;
 const $ = id => document.getElementById(id);
 const statut = t => $('statut').textContent = t;
 
-// Attend que les infos réseau (ICE) soient toutes collectées
+let pc = null;
+let canal = null;
+let meta = null, morceaux = [], recu = 0;
+
+function nouvelleConnexion() {
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+  pc.onconnectionstatechange = () => statut('Connexion : ' + pc.connectionState);
+  pc.ondatachannel = e => brancherCanal(e.channel);
+  return pc;
+}
+
+// Attend la fin de la collecte ICE, avec un délai de sécurité
 function attendreIce() {
   return new Promise(res => {
     if (pc.iceGatheringState === 'complete') return res();
-    pc.addEventListener('icegatheringstatechange', () => {
-      if (pc.iceGatheringState === 'complete') res();
-    });
+    const verifier = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', verifier);
+        res();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', verifier);
+    setTimeout(res, 5000); // on continue quoi qu'il arrive après 5 s
   });
 }
 
 function brancherCanal(c) {
   canal = c;
   canal.binaryType = 'arraybuffer';
-  canal.onopen = () => statut('Connecté');
+  canal.onopen = () => statut('Connecté ✅');
+  canal.onclose = () => statut('Canal fermé');
   canal.onmessage = e => recevoir(e.data);
 }
 
-// Côté envoyeur : on crée le canal et l'offre
+function encoder(desc) {
+  return btoa(unescape(encodeURIComponent(JSON.stringify(desc))));
+}
+function decoder(texte) {
+  return JSON.parse(decodeURIComponent(escape(atob(texte.trim()))));
+}
+
+// Envoyeur : créer l'offre
 $('creer').onclick = async () => {
-  brancherCanal(pc.createDataChannel('fichier'));
-  await pc.setLocalDescription(await pc.createOffer());
-  await attendreIce();
-  $('monCode').value = btoa(JSON.stringify(pc.localDescription));
+  try {
+    nouvelleConnexion();
+    brancherCanal(pc.createDataChannel('fichier'));
+    statut('Création de l\'offre...');
+    await pc.setLocalDescription(await pc.createOffer());
+    await attendreIce();
+    $('monCode').value = encoder(pc.localDescription);
+    statut('Offre prête, copie-la et envoie-la à l\'autre personne.');
+  } catch (err) {
+    statut('Erreur : ' + err.message);
+  }
 };
 
-// Côté envoyeur : on applique la réponse reçue
+// Envoyeur : appliquer la réponse
 $('connecter').onclick = async () => {
-  const reponse = JSON.parse(atob($('codeReponse').value.trim()));
-  await pc.setRemoteDescription(reponse);
+  try {
+    await pc.setRemoteDescription(decoder($('codeReponse').value));
+    statut('Réponse appliquée, connexion en cours...');
+  } catch (err) {
+    statut('Erreur : ' + err.message);
+  }
 };
 
-// Côté receveur : on reçoit le canal et on génère la réponse
-pc.ondatachannel = e => brancherCanal(e.channel);
-
+// Receveur : générer la réponse à partir de l'offre
 $('repondre').onclick = async () => {
-  const offre = JSON.parse(atob($('codeOffre').value.trim()));
-  await pc.setRemoteDescription(offre);
-  await pc.setLocalDescription(await pc.createAnswer());
-  await attendreIce();
-  $('maReponse').value = btoa(JSON.stringify(pc.localDescription));
+  try {
+    nouvelleConnexion();
+    await pc.setRemoteDescription(decoder($('codeOffre').value));
+    await pc.setLocalDescription(await pc.createAnswer());
+    await attendreIce();
+    $('maReponse').value = encoder(pc.localDescription);
+    statut('Réponse prête, renvoie-la à l\'envoyeur.');
+  } catch (err) {
+    statut('Erreur : ' + err.message);
+  }
 };
 
 // Envoi du fichier
@@ -95,7 +129,6 @@ $('envoyer').onclick = async () => {
 
   for (let off = 0; off < f.size; off += CHUNK) {
     const buf = await f.slice(off, off + CHUNK).arrayBuffer();
-    // Contre-pression : on attend si le buffer d'envoi se remplit
     while (canal.bufferedAmount > 4 * 1024 * 1024) {
       await new Promise(r => setTimeout(r, 20));
     }
@@ -104,7 +137,7 @@ $('envoyer').onclick = async () => {
   }
   canal.send('EOF');
   $('progression').value = 100;
-  statut('Envoi terminé ');
+  statut('Envoi terminé ✅');
 };
 
 // Réception
@@ -116,7 +149,7 @@ function recevoir(d) {
       lien.href = URL.createObjectURL(blob);
       lien.download = meta.name;
       lien.textContent = `Télécharger ${meta.name}`;
-      statut('Fichier reçu ');
+      statut('Fichier reçu ✅');
       morceaux = []; recu = 0; meta = null;
     } else {
       meta = JSON.parse(d);
